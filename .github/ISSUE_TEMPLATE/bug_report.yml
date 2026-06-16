@@ -1,0 +1,37 @@
+name: Bug report
+description: Something in the SDK is broken or behaves unexpectedly.
+labels: [bug, triage]
+body:
+  - type: input
+    id: sdk
+    attributes:
+      label: SDK + version
+      placeholder: "isorun 1.0.0 (Node 22)"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Minimal code + the command you ran.
+      render: typescript
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What actually happened?
+      description: Include stack trace, HTTP status, server error ID if any.
+    validations:
+      required: true
+  - type: input
+    id: sandbox-id
+    attributes:
+      label: Sandbox ID (if applicable)
+      description: Helps us correlate server-side logs.

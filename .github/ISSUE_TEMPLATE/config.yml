@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Docs
+    url: https://docs.isorun.ai
+    about: Quickstart, API reference, examples.
+  - name: Security
+    url: https://github.com/isorun/sdk/security/advisories/new
+    about: Report a security issue privately.
+  - name: Support
+    url: mailto:support@isorun.ai
+    about: Account, billing, or usage questions.

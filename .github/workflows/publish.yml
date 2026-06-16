@@ -1,0 +1,49 @@
+name: Publish to npm
+
+# Publishes `isorun` to npm with provenance when a GitHub Release is published.
+# Auth is via npm Trusted Publishing (OIDC) — no NPM_TOKEN secret. The trust
+# relationship is registered once on npm with:
+#   npm trust github isorun --file .github/workflows/publish.yml \
+#     --repo isorun/sdk --env release --allow-publish
+# Provenance ("Built and signed on GitHub Actions") requires a public repo.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write # REQUIRED: lets the job mint the OIDC token npm verifies
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release # manual-approval gate before anything hits npm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22' # >= 22.14 required for OIDC
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm >= 11.5.1; the runner ships an older line.
+      - run: npm install -g npm@latest
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm run build
+
+      # Fail loudly if the release tag doesn't match the package version, so a
+      # mistagged release can't publish the wrong version.
+      - name: Verify tag matches package version
+        run: |
+          PKG_VERSION="v$(node -p "require('./package.json').version")"
+          if [ "${GITHUB_REF_NAME}" != "${PKG_VERSION}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} != package version ${PKG_VERSION}"
+            exit 1
+          fi
+
+      - run: npm publish --provenance --access public

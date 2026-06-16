@@ -1,0 +1,11 @@
+# Trivy misconfiguration ignores. Each entry must document WHY the rule
+# does not apply. Keep this list short and justified.
+
+# DS-0002 "Specify a non-root USER".
+# src/claude-agents/Dockerfile.base is the base image for a
+# per-session VM, not a shared-kernel container. The
+# isolation boundary is the VM itself; the agent runner and user
+# workloads legitimately need root for runtime `apt install` and native
+# builds. A USER directive would break those without adding isolation the
+# VM doesn't already provide.
+AVD-DS-0002

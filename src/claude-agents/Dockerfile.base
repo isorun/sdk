@@ -1,0 +1,245 @@
+# Isorun base image for Anthropic Claude Managed Agents.
+#
+# This file is the canonical *source* of the published base image
+# (docker.io/isorun/claude-agents). The image is built with the compiled
+# in-VM runner (`runner.mjs`) copied in alongside it, so a plain
+# `docker build` from this directory alone would fail at `COPY runner.mjs`.
+#
+# Philosophy: agents get a laptop, not a chroot — favour capability over
+# minimalism. Mirrors Anthropic's cloud-container reference family (Ubuntu):
+# agents that work on Anthropic's hosted containers should work here without
+# "module not found"-class surprises.
+#
+# Reference: https://platform.claude.com/docs/en/managed-agents/cloud-containers
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+# Note: ubuntu:26.04 shipped /usr/bin/pebble (Go 1.26.2, 5 unfixed
+# stdlib CVEs) as its container init. 24.04 does not ship pebble - its
+# attestation is clean. Defensive removal in case a future minor pulls
+# it in.
+RUN rm -f /usr/bin/pebble
+
+# Tombstone for the linux-libc-dev removal at the end of this Dockerfile:
+# kernel headers ship in libc6-dev's dependency chain by default but no
+# agent workload needs them (we don't compile kernel modules in the
+# sandbox). Removed below after build-essential is fully installed so
+# we don't break the compile-chain mid-build.
+
+# Layer 1: system + dev tools that ship in apt. Single RUN to keep the
+# layer count down; --no-install-recommends throughout. `apt-get upgrade`
+# runs first to pick up any post-base-image security patches.
+RUN apt-get update \
+    && apt-get -y upgrade \
+    && apt-get install -y --no-install-recommends \
+      # Hard requirements from the Anthropic SDK helper spec
+      bash unzip tar \
+      # Anthropic cloud-container reference: system + utilities
+      ca-certificates curl wget zip git jq ripgrep tree nano patch diffutils \
+      make cmake build-essential pkg-config \
+      openssh-client gnupg lsb-release apt-transport-https \
+      # Editors + multiplexers agents may shell out to
+      tmux screen \
+      # Database clients (servers not bundled; agents bring their own).
+      # redis-tools dropped - Ubuntu's package carries a long unpatched
+      # CVE tail (CVE-2024-31227 etc.); agents that need redis-cli can
+      # `apt install redis-tools` at runtime.
+      sqlite3 postgresql-client \
+      # Python: 3.12 on 24.04. uv installed separately below.
+      python3 python3-pip python3-venv \
+      # Native build chain - Ruby gems, Python wheels, Rust/cgo native
+      # libs all need this
+      autoconf bison \
+      libssl-dev libyaml-dev libreadline-dev zlib1g-dev libffi-dev \
+      libncurses-dev libgdbm-dev libdb-dev \
+      # Localisation
+      locales \
+    && rm -rf /var/lib/apt/lists/* \
+    # C.UTF-8 (set in ENV above) is always available without locale-gen;
+    # also pre-generate en_US.UTF-8 for tools that expect a "real" locale.
+    && locale-gen en_US.UTF-8 || true
+
+# Replace apt-shipped python3-pip (24.0 - CVE tail), python3-setuptools
+# (68.1.2 - CVE-2024-6345, CVE-2025-47273), python3-wheel (0.42.0 -
+# CVE-2026-24049) and python3-pip-whl (24.0 offline wheel cache) with
+# current upstream versions via pip itself. apt-purge removes the
+# package state cleanly so `dpkg -l` and scanner metadata both reflect
+# the upgrade. `ensurepip` then re-bootstraps pip into the system Python
+# and `pip install --upgrade` brings the trio to latest in one shot.
+RUN apt-get -y purge python3-pip python3-pip-whl python3-setuptools \
+                      python3-setuptools-whl python3-wheel \
+    && apt-get -y autoremove \
+    && rm -rf /var/lib/apt/lists/* \
+              /usr/lib/python3/dist-packages/pip \
+              /usr/lib/python3/dist-packages/pip-*.dist-info \
+              /usr/lib/python3/dist-packages/setuptools \
+              /usr/lib/python3/dist-packages/setuptools-*.egg-info \
+              /usr/lib/python3/dist-packages/wheel \
+              /usr/lib/python3/dist-packages/wheel-*.dist-info \
+              /usr/lib/python3/dist-packages/_distutils_hack \
+              /usr/lib/python3/dist-packages/pkg_resources \
+    # ensurepip is unavailable once python3-pip-whl is purged (it
+    # depends on the bundled wheel cache). Bootstrap from pypa's
+    # get-pip.py directly. --break-system-packages because PEP 668
+    # marks the system Python as externally managed.
+    && curl -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py \
+    && python3 /tmp/get-pip.py --break-system-packages --no-cache-dir \
+         pip setuptools wheel \
+    && rm /tmp/get-pip.py
+
+# Node.js 22 LTS from the official nodejs.org binary tarball. The
+# tarball is self-contained, signed, and the same approach the upstream
+# Node Docker images use.
+ENV NODE_VERSION=22.22.3
+RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+      -o /tmp/node.tar.xz \
+    && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner \
+       --exclude='*.md' --exclude='LICENSE' --exclude='share' \
+    && rm /tmp/node.tar.xz \
+    && ln -sf /usr/local/bin/node /usr/local/bin/nodejs \
+    && node --version && npm --version
+
+# uv - Anthropic spec calls it out; ~10x faster than pip and the
+# de-facto standard for new Python projects.
+RUN curl -fsSL https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+
+# Upgrade npm + corepack, then enable yarn + pnpm via corepack.
+# corepack needs upgrading because the version bundled with Node 22.22.3
+# was published before pnpm's latest signing-key rotation and rejects
+# `corepack prepare pnpm@latest` with "Cannot find matching keyid".
+RUN npm install -g npm@latest corepack@latest \
+    && npm cache clean --force \
+    && corepack enable \
+    && corepack prepare yarn@stable --activate \
+    && corepack prepare pnpm@latest --activate
+
+# Layer 2: polyglot runtimes Anthropic's reference container ships.
+# Installed from upstream tarballs / official installers, not apt - apt
+# versions are usually too old.
+
+# Go 1.22+ from go.dev (Go's own download server).
+ENV GO_VERSION=1.26.3
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+      | tar -xz -C /usr/local \
+    && ln -s /usr/local/go/bin/go /usr/local/bin/go \
+    && ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+
+# Rust 1.77+ via rustup (stable, minimal profile).
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl -fsSL https://sh.rustup.rs \
+      | sh -s -- -y --no-modify-path --default-toolchain stable --profile minimal \
+    && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
+
+# Java 21 LTS (Temurin) from Adoptium.
+RUN mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://packages.adoptium.net/artifactory/api/gpg/key/public \
+         -o /etc/apt/keyrings/adoptium.asc \
+    && echo "deb [signed-by=/etc/apt/keyrings/adoptium.asc] https://packages.adoptium.net/artifactory/deb $(lsb_release -cs) main" \
+         > /etc/apt/sources.list.d/adoptium.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends temurin-21-jdk \
+    && rm -rf /var/lib/apt/lists/*
+
+# Maven from official binary tarball. Ubuntu's apt maven uses a shared
+# /usr/share/java/plexus-utils.jar pinned at 3.4.2 which carries
+# CVE-2025-67030 (path traversal). The upstream tarball ships
+# self-contained lib/ with current plexus-utils.
+ENV MAVEN_VERSION=3.9.16
+RUN curl -fsSL "https://dlcdn.apache.org/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" \
+      | tar -xz -C /opt \
+    && ln -sf "/opt/apache-maven-${MAVEN_VERSION}/bin/mvn" /usr/local/bin/mvn
+
+# Ruby 3.x + PHP 8.x + Composer.
+# Upgrade ruby-bundled gems past known CVEs after apt install. Bundled
+# gems that ship with Ruby 3.2.3 (apt's ruby-full on 24.04) carry a long
+# tail of CVEs that Ubuntu doesn't backport - we install newer versions
+# directly via `gem install` and purge the old gemspecs so scanners pick
+# up the gem-installed copy and `require` resolves to it.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ruby-full \
+      php-cli php-common php-curl php-mbstring php-xml php-zip \
+    && rm -rf /var/lib/apt/lists/* \
+    && gem install --no-document \
+         erb net-imap rexml webrick cgi uri resolv zlib rdoc \
+    # Delete the Ruby-bundled (default) gemspecs + gem dirs for the
+    # CVE-affected versions so Scout/Trivy don't index the old copies.
+    # The bundled gems live under /usr/lib/ruby/gems/<ver>/, distinct
+    # from `gem install`'s /var/lib/gems/<ver>/ (Gem.default_dir).
+    # webrick on Ubuntu ships in /usr/share/rubygems-integration/all/.
+    # Ruby's require falls back to the gem-installed newer versions.
+    && BUNDLED_SPECS=$(ruby -e 'puts File.dirname(Gem.default_specifications_dir)') \
+    && BUNDLED_GEMS_DIR=$(dirname "$BUNDLED_SPECS")/gems \
+    && for name in erb net-imap rexml webrick cgi uri resolv zlib rdoc; do \
+         rm -f "$BUNDLED_SPECS"/default/"$name"-*.gemspec \
+               "$BUNDLED_SPECS"/"$name"-*.gemspec \
+               /usr/share/rubygems-integration/all/specifications/"$name"-*.gemspec; \
+         rm -rf "$BUNDLED_GEMS_DIR"/"$name"-* \
+                /usr/share/rubygems-integration/all/gems/"$name"-*; \
+       done \
+    # "Default gems" (erb, rexml, cgi, uri, resolv, zlib, rdoc) also
+    # ship a copy of their source on the stdlib LOAD_PATH which shadows
+    # the gem-installed versions on `require`. Remove the bundled-source
+    # copies so require resolves to /var/lib/gems (CVE-clean).
+    # zlib and cgi have native .so extensions that we keep - the .rb
+    # wrapper is what the gem provides newer.
+    && RUBY_STDLIB_DIR=$(ruby -e 'puts RbConfig::CONFIG["rubylibdir"]') \
+    && RUBY_ARCHLIB_DIR=$(ruby -e 'puts RbConfig::CONFIG["archdir"]') \
+    && rm -f  "$RUBY_STDLIB_DIR"/erb.rb \
+              "$RUBY_STDLIB_DIR"/rexml.rb \
+              "$RUBY_STDLIB_DIR"/cgi.rb \
+              "$RUBY_STDLIB_DIR"/uri.rb \
+              "$RUBY_STDLIB_DIR"/resolv.rb \
+              "$RUBY_STDLIB_DIR"/rdoc.rb \
+    && rm -rf "$RUBY_STDLIB_DIR"/erb \
+              "$RUBY_STDLIB_DIR"/rexml \
+              "$RUBY_STDLIB_DIR"/cgi \
+              "$RUBY_STDLIB_DIR"/uri \
+              "$RUBY_STDLIB_DIR"/resolv \
+              "$RUBY_STDLIB_DIR"/rdoc \
+              "$RUBY_ARCHLIB_DIR"/erb \
+    && curl -fsSL https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+
+# Image labels for hub.docker.com discoverability and tooling.
+LABEL org.opencontainers.image.title="isorun-claude-agents" \
+      org.opencontainers.image.description="Base image for Anthropic Claude Managed Agents on Isorun VMs" \
+      org.opencontainers.image.url="https://docs.isorun.ai/integrations/claude-managed-agents" \
+      org.opencontainers.image.documentation="https://docs.isorun.ai/integrations/claude-managed-agents" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.vendor="Isorun" \
+      io.isorun.claude.managed-agents-beta="managed-agents-2026-04-01"
+
+# Anthropic SDK pre-installed at a known location so the runner doesn't
+# spend boot budget on npm resolution. The runner sits alongside its
+# node_modules so Node's module resolution finds @anthropic-ai/sdk
+# without NODE_PATH gymnastics.
+RUN mkdir -p /opt/isorun-claude-runner
+WORKDIR /opt/isorun-claude-runner
+COPY package.json package.json
+RUN npm install --omit=dev --no-audit --no-fund --prefer-offline \
+    && npm cache clean --force
+COPY runner.mjs /opt/isorun-claude-runner/runner.mjs
+
+# Spec workdir + output mount.
+# /mnt/session is the workdir convention shared with Anthropic's cloud
+# container; the grader for `user.define_outcome` looks for deliverables
+# under /mnt/session/outputs.
+RUN mkdir -p /mnt/session/outputs
+WORKDIR /mnt/session
+
+# Drop linux-libc-dev (kernel headers - CVE-2026-46333 unfixed upstream)
+# at the very end, AFTER everything else is installed. Use --force-depends
+# because libc6-dev technically depends on it; in practice the compile
+# chain stays usable for normal Python wheels / native gems because
+# libc6-dev's own headers (glibc) are what matters. Agents that need
+# linux/* headers (kernel module dev, eBPF tools) can install on demand.
+RUN dpkg --remove --force-depends linux-libc-dev \
+    && rm -rf /usr/include/linux /usr/include/asm /usr/include/asm-generic
+
+# Default: idle. The orchestrator invokes the runner via sandbox.exec
+# once it has a work item and the ANTHROPIC_* env vars to pass.
+CMD ["sleep", "infinity"]

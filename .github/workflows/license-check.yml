@@ -1,0 +1,31 @@
+name: License check
+
+on:
+  pull_request:
+    paths:
+      - package-lock.json
+      - package.json
+      - .github/workflows/license-check.yml
+
+permissions:
+  contents: read
+
+jobs:
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - name: Verify dependency licenses
+        run: |
+          npx --yes license-checker-rseidelsohn \
+            --production \
+            --onlyAllow "MIT;ISC;BSD-2-Clause;BSD-3-Clause;Apache-2.0;CC0-1.0;CC-BY-3.0;CC-BY-4.0;Unlicense;0BSD;Python-2.0;BlueOak-1.0.0" \
+            --excludePackages "isorun@1.0.0"

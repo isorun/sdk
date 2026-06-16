@@ -1,0 +1,121 @@
+name: Security scan
+
+# Free-tool replacement for GitHub Advanced Security:
+#
+#   semgrep      - TS/JS rulesets
+#   zizmor       - workflow auditor
+#
+# Results are uploaded as artifacts (30d retention) and summarised in
+# $GITHUB_STEP_SUMMARY. SARIF upload to the Security tab needs GitHub
+# Advanced Security on private repos, which we don't have - so we
+# surface findings via the Actions UI instead.
+#
+# The workflow is informational-only: scanners are wrapped with `|| true`
+# so a finding doesn't fail the build. Flip to fail-on-HIGH once the
+# baseline drops to near zero.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly Monday 06:17 UTC.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # On PRs, cancel superseded runs (one scan per PR). On main / schedule,
+  # let each run finish - losing a weekly snapshot to a same-day cancel
+  # is worse than burning a few extra minutes.
+  group: security-scan-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  semgrep:
+    name: Semgrep
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install semgrep
+        run: pip install --user semgrep
+      - name: Run semgrep
+        run: |
+          ~/.local/bin/semgrep \
+            --config=p/security-audit --config=p/owasp-top-ten --config=p/secrets \
+            --config=p/javascript --config=p/typescript \
+            --json --metrics=off \
+            --exclude=node_modules --exclude=dist \
+            --output=semgrep.json . || true
+      - name: Summarize
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, collections
+          if not os.path.exists('semgrep.json'):
+              print('no semgrep.json - scanner step failed; see logs above'); sys.exit(0)
+          d = json.load(open('semgrep.json'))
+          r = d.get('results', [])
+          c = collections.Counter(x.get('extra',{}).get('severity','INFO') for x in r)
+          rules = collections.Counter(x['check_id'].split('.')[-1] for x in r)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(f"## Semgrep - {len(r)} findings\n\n")
+              if r:
+                  f.write("| severity | count |\n|---|---:|\n")
+                  for sev, n in c.most_common(): f.write(f"| {sev} | {n} |\n")
+                  f.write("\n### Top rules\n\n| rule | count |\n|---|---:|\n")
+                  for rid, n in rules.most_common(10): f.write(f"| `{rid}` | {n} |\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true  # don't fail the job if storage quota is full
+        with:
+          name: semgrep-results
+          path: semgrep.json
+          retention-days: 30
+
+  zizmor:
+    name: zizmor (workflow auditor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install zizmor (prebuilt binary)
+        run: |
+          curl -fsSL https://github.com/zizmorcore/zizmor/releases/latest/download/zizmor-x86_64-unknown-linux-gnu.tar.gz -o /tmp/zizmor.tgz
+          mkdir -p /tmp/zizmor && tar xzf /tmp/zizmor.tgz -C /tmp/zizmor
+      - name: Run zizmor
+        run: /tmp/zizmor/zizmor --no-online-audits --format=json .github/workflows/ > zizmor.json || true
+      - name: Summarize
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, collections
+          if not os.path.exists('zizmor.json'):
+              print('no zizmor.json - scanner step failed; see logs above'); sys.exit(0)
+          d = json.load(open('zizmor.json'))
+          c = collections.Counter((x.get('ident'), x.get('determinations',{}).get('severity')) for x in d)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(f"## zizmor - {len(d)} workflow findings\n\n")
+              if d:
+                  f.write("| rule | severity | count |\n|---|---|---:|\n")
+                  for (rid, sev), n in c.most_common(20): f.write(f"| `{rid}` | {sev} | {n} |\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true  # don't fail the job if storage quota is full
+        with:
+          name: zizmor-results
+          path: zizmor.json
+          retention-days: 30
