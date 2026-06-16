@@ -30,7 +30,6 @@ const { stdout } = await sandbox.exec('node -v')
 console.log(stdout) // v22.x.x
 
 await sandbox.destroy()
-isorun.close() // release pooled connections so the process can exit
 ```
 
 Get an API key at [app.isorun.ai](https://app.isorun.ai).
@@ -166,7 +165,6 @@ await isorun.networkProfiles()     // → NetworkProfile[]
 await isorun.usage()               // → UsageSummary
 await isorun.history()             // → SandboxHistoryEntry[]
 await isorun.connect()             // optionally pre-open connections before issuing requests
-isorun.close()                     // close pooled connections so the process can exit
 ```
 
 ### Sandbox methods
