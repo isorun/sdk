@@ -1,9 +1,11 @@
 # isorun
 
-[![npm](https://img.shields.io/npm/v/isorun?label=isorun)](https://www.npmjs.com/package/isorun)
-[![license](https://img.shields.io/npm/l/isorun)](https://github.com/isorun/sdk/blob/main/LICENSE)
-[![types](https://img.shields.io/npm/types/isorun)](https://www.npmjs.com/package/isorun)
-[![docs](https://img.shields.io/badge/docs-docs.isorun.ai-blue)](https://docs.isorun.ai)
+[![npm](https://img.shields.io/npm/v/isorun?logo=npm&label=npm)](https://www.npmjs.com/package/isorun)
+[![types](https://img.shields.io/npm/types/isorun?logo=typescript&logoColor=white)](https://www.npmjs.com/package/isorun)
+[![node](https://img.shields.io/node/v/isorun?logo=nodedotjs&logoColor=white&label=node)](https://www.npmjs.com/package/isorun)
+[![provenance](https://img.shields.io/badge/provenance-signed-brightgreen?logo=github)](https://www.npmjs.com/package/isorun)
+[![license](https://img.shields.io/npm/l/isorun?color=blue)](https://github.com/isorun/sdk/blob/main/LICENSE)
+[![docs](https://img.shields.io/badge/docs-docs.isorun.ai-blue?logo=readthedocs&logoColor=white)](https://docs.isorun.ai)
 
 Official TypeScript SDK for [Isorun](https://isorun.ai). Create an isolated Linux VM from any container image, run commands in it, read and write files, and tear it down — billed by the second.
 
