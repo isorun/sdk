@@ -26,49 +26,44 @@ import { Agent, request } from 'undici'
 // trips a per-client breaker that falls back to HTTP/2 for the rest of the
 // client's life. This package is ESM (`type: module`), so use createRequire to
 // load the optional CJS native addon.
+//
+// Bundle-safe base for createRequire: as ESM, import.meta.url is set. But when a
+// consumer inlines this SDK into a CJS bundle (esbuild — what benchmark harnesses
+// do), import.meta.url is undefined, and createRequire(undefined) THROWS at module
+// load — crashing the H3 loader (and, in builds that shim it differently, silently
+// dropping the client to HTTP/2). In the CJS-bundled form the `__filename` global
+// exists, so use it (createRequire accepts a path string or a file URL). This keeps
+// the native H3 transport loadable whether imported as ESM or bundled to CJS.
 import { createRequire } from 'node:module'
-import { dirname, join } from 'node:path'
-const _h3require = createRequire(import.meta.url)
-let _h3: any = null
-function loadH3(): any {
-  if (_h3 !== null) return _h3
-  // The native transport ships as platform-specific packages; if one is
-  // installed, point the loader at it.
-  if (!process.env.NAPI_RS_NATIVE_LIBRARY_PATH) {
-    for (const spec of [
-      '@isorun/http-transport-linux-x64-gnu/transport.node',
-      '@isorun/http-transport-linux-arm64-gnu/transport.node',
-      '@isorun/http-transport-linux-x64-musl/transport.node',
-      '@isorun/http-transport-linux-arm64-musl/transport.node',
-    ]) {
-      try {
-        process.env.NAPI_RS_NATIVE_LIBRARY_PATH = _h3require.resolve(spec)
-        break
-      } catch { /* not this platform — try the next */ }
-    }
+// @ts-ignore -- __filename exists only in the CJS-bundled form; typeof-guarded so neither branch throws.
+const _h3require = createRequire(typeof __filename !== 'undefined' ? __filename : import.meta.url)
+
+// Load the native HTTP/3 transport directly from our own platform-specific
+// package. Each `@isorun/http-transport-*` ships a napi addon whose `.node`
+// exports NativeWorkerClient — no third-party JS wrapper, so the SDK owns the
+// whole H3 path and carries no external native dependency. If none matches this
+// platform, the binding is absent and the SDK uses the HTTP/2 path instead.
+let _binding: any = null
+function loadBinding(): any {
+  if (_binding !== null) return _binding
+  for (const spec of [
+    '@isorun/http-transport-linux-x64-gnu/transport.node',
+    '@isorun/http-transport-linux-arm64-gnu/transport.node',
+    '@isorun/http-transport-linux-x64-musl/transport.node',
+    '@isorun/http-transport-linux-arm64-musl/transport.node',
+    '@isorun/http-transport-darwin-arm64/transport.node',
+  ]) {
+    try {
+      const b = _h3require(_h3require.resolve(spec))
+      if (b && b.NativeWorkerClient) { _binding = b; return b }
+    } catch { /* not this platform — try the next */ }
   }
-  try { _h3 = _h3require('@currentspace/http3') }
-  catch { _h3 = false }
-  return _h3
+  _binding = false
+  return false
 }
 // Pre-load the native transport at import time. Guarded for runtimes without
 // setImmediate, where the HTTP/2 path is used anyway.
 if (typeof setImmediate === 'function') setImmediate(() => { try { loadBinding() } catch { /* best-effort */ } })
-
-// Load the native binding object. It lives at the package root `index.js`, not
-// the high-level dist wrapper; load it by absolute path (the package `exports`
-// map blocks the subpath specifier).
-let _binding: any = null
-function loadBinding(): any {
-  if (_binding !== null) return _binding
-  if (!loadH3()) { _binding = false; return false }
-  try {
-    const pkgRoot = dirname(dirname(_h3require.resolve('@currentspace/http3')))
-    const b = _h3require(join(pkgRoot, 'index.js'))
-    _binding = b && b.NativeWorkerClient ? b : false
-  } catch { _binding = false }
-  return _binding
-}
 
 // H3 event type discriminants (must match the native transport's event enum).
 const H3_EV_HEADERS = 3

@@ -1,6 +1,6 @@
 {
   "name": "isorun",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "TypeScript SDK for Isorun — isolated Linux VM sandboxes for running untrusted and AI-generated code",
   "type": "module",
   "main": "dist/index.js",
@@ -90,14 +90,14 @@
     }
   },
   "dependencies": {
-    "@currentspace/http3": "^0.8.5",
     "undici": "8.3.0"
   },
   "optionalDependencies": {
     "@isorun/http-transport-linux-x64-gnu": "^0.8.8",
     "@isorun/http-transport-linux-arm64-gnu": "^0.8.8",
     "@isorun/http-transport-linux-x64-musl": "^0.8.8",
-    "@isorun/http-transport-linux-arm64-musl": "^0.8.8"
+    "@isorun/http-transport-linux-arm64-musl": "^0.8.8",
+    "@isorun/http-transport-darwin-arm64": "^0.8.8"
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.98.0",
