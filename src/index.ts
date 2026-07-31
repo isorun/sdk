@@ -74,10 +74,20 @@ const H3_EV_SESSION_CLOSE = 7
 const H3_EV_ERROR = 10
 const H3_EV_HANDSHAKE = 11
 
+// A request that is waiting on a long-running command sends no packets, so the
+// connection must not be torn down for being idle. Negotiated as min(client,
+// server); kept alive by a PING below.
+const H3_IDLE_TIMEOUT_MS = 120_000
+// Well under H3_IDLE_TIMEOUT_MS, so several may be missed without tripping it.
+const H3_PING_INTERVAL_MS = 10_000
+// Safe to re-send after a transport failure with no response. POST is not.
+const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'PUT', 'DELETE', 'OPTIONS', 'TRACE'])
+
 interface H3Pending {
   status: number
   chunks: Buffer[]
   gotResponse: boolean
+  sent: boolean
   finish: () => void
   failTransport: () => void
 }
@@ -101,7 +111,7 @@ export interface IsorunOptions {
 
 /** Options for creating a sandbox. */
 export interface CreateOptions {
-  /** Container image (e.g. `node:22-slim`, `python:3.12-slim`). Default: `node:22-slim`. */
+  /** Container image (e.g. `node:22`, `python:3.12-slim`). Default: `node:22`. */
   image?: string
   /** Virtual CPUs. Default: 1. */
   vcpus?: number
@@ -109,7 +119,7 @@ export interface CreateOptions {
   memMiB?: number
   /** Scratch disk in MiB. Default: 4096. */
   diskMiB?: number
-  /** Auto-destroy timeout in seconds. Default: 300. */
+  /** Auto-destroy timeout in seconds. Default: 600 (10 min). */
   timeoutSec?: number
   /** Egress allow/deny lists. Empty arrays = unrestricted. CIDRs, hostnames, and `*.wildcards` are accepted. */
   network?: { allow?: string[]; deny?: string[] }
@@ -241,6 +251,13 @@ export class IsorunError extends Error {
 export interface RequestOptions {
   /** Cancel the request via an `AbortController` / `AbortSignal`. */
   signal?: AbortSignal
+  /**
+   * Client-side transport deadline in ms. Derived from a command's `timeoutSec`
+   * so a long-running `exec` isn't killed by the transport before the server's
+   * own timeout elapses. When unset, the conservative per-path defaults apply
+   * (120s for JSON, 60s for raw). Set generously above the server timeout.
+   */
+  timeoutMs?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -502,6 +519,7 @@ export class Isorun {
             runtimeMode: 'portable',
             initialMaxStreamDataBidiLocal: streamWin,
             initialMaxData,
+            maxIdleTimeoutMs: H3_IDLE_TIMEOUT_MS,
           },
           (err: any, events: any[]) => {
             if (err) return
@@ -578,9 +596,16 @@ export class Isorun {
       let settled = false
       let sid = -1
       let timer: ReturnType<typeof setTimeout>
+      // Keep the connection alive while the server is still working. unref'd so
+      // it can never hold the process open on its own.
+      const keepalive = setInterval(() => {
+        try { conn.client?.ping() } catch { /* session already gone; failTransport handles it */ }
+      }, H3_PING_INTERVAL_MS)
+      keepalive.unref?.()
       const onAbort = () => bad(opts.signal?.reason ?? new Error('aborted'))
       const cleanup = () => {
         clearTimeout(timer)
+        clearInterval(keepalive)
         opts.signal?.removeEventListener('abort', onAbort)
         if (sid >= 0) conn.waiters.delete(sid)
       }
@@ -589,13 +614,14 @@ export class Isorun {
       // Request deadline: a stalled stream can't hang the promise forever. NOT
       // tagged h3transport — a timed-out request must not silently re-fire on
       // H2 (a POST could duplicate).
-      timer = setTimeout(() => bad(new Error('h3 request timeout')), 120_000)
+      timer = setTimeout(() => bad(new Error('h3 request timeout')), opts.timeoutMs ?? 120_000)
       if (opts.signal) opts.signal.addEventListener('abort', onAbort, { once: true })
 
       const pending: H3Pending = {
         status: 0,
         chunks: [],
         gotResponse: false,
+        sent: false,
         finish: () => {
           // Decode once over all chunks so a multi-byte UTF-8 char split across
           // a chunk boundary is reassembled correctly.
@@ -609,10 +635,17 @@ export class Isorun {
         },
         // Stream reset/error or session close. If the response had started, it's
         // a genuine mid-stream failure (don't silently re-fire on H2 — a POST
-        // could duplicate). If not, tag h3transport so json() falls back.
+        // could duplicate). If not, tag h3transport so json() falls back, and
+        // carry whether the request already went out: "no response" does not
+        // mean the server did not act on it.
         failTransport: () => {
           if (pending.gotResponse) { bad(new Error('h3 stream error')) }
-          else { const err: any = new Error('h3 transport: stream error'); err.h3transport = true; bad(err) }
+          else {
+            const err: any = new Error('h3 transport: stream error')
+            err.h3transport = true
+            err.h3sent = pending.sent
+            bad(err)
+          }
         },
       }
 
@@ -626,10 +659,16 @@ export class Isorun {
       if (data) headers.push({ name: 'content-type', value: 'application/json' })
       try {
         sid = conn.client.sendRequest(headers, !data)
+        // On the wire from here on, so the server may act on it regardless of
+        // whether we see a response.
+        pending.sent = true
         conn.waiters.set(sid, pending)
         if (data) conn.client.streamSend(sid, Buffer.from(data), true)
       } catch (e: any) {
-        const err: any = new Error('h3 transport: ' + e?.message); err.h3transport = true; return bad(err)
+        const err: any = new Error('h3 transport: ' + e?.message)
+        err.h3transport = true
+        err.h3sent = pending.sent
+        return bad(err)
       }
       })
     } finally {
@@ -640,11 +679,11 @@ export class Isorun {
   /** Create a new sandbox. */
   async create(options: CreateOptions = {}, opts: RequestOptions = {}): Promise<Sandbox> {
     const body: Record<string, any> = {
-      image: options.image ?? 'node:22-slim',
+      image: options.image ?? 'node:22',
       vcpus: options.vcpus,
       mem_mib: options.memMiB,
       disk_mib: options.diskMiB,
-      timeout: options.timeoutSec ?? 300,
+      timeout: options.timeoutSec ?? 600,
     }
     if (options.network) body.network = options.network
     if (options.networkProfile) body.network_profile = options.networkProfile
@@ -754,6 +793,14 @@ export class Isorun {
           // skips the native transport. A mid-stream glitch on a healthy pool
           // just falls back this one request.
           if (e.h3connect) this.h3Broken = true
+          // Losing the connection after the request went out does not mean the
+          // server did not act on it, so a non-idempotent method must not be
+          // re-sent. Surface it; the caller decides whether a retry is safe.
+          if (e.h3sent && !IDEMPOTENT_METHODS.has(method.toUpperCase())) {
+            throw new Error(
+              `h3 transport lost after ${method} ${path} was sent; not retrying a non-idempotent request (it may have executed)`,
+            )
+          }
         }
       }
       const { statusCode, body: res } = await request(this.apiUrl + path, {
@@ -764,8 +811,8 @@ export class Isorun {
           ...(data ? { 'content-type': 'application/json' } : {}),
         },
         body: data,
-        headersTimeout: 120_000,
-        bodyTimeout: 120_000,
+        headersTimeout: opts.timeoutMs ?? 120_000,
+        bodyTimeout: opts.timeoutMs ?? 120_000,
         signal: opts.signal,
       })
       const text = await res.text()
@@ -786,8 +833,8 @@ export class Isorun {
         ...(body ? { 'content-type': 'application/octet-stream' } : {}),
       },
       body,
-      headersTimeout: 60_000,
-      bodyTimeout: 60_000,
+      headersTimeout: opts.timeoutMs ?? 60_000,
+      bodyTimeout: opts.timeoutMs ?? 60_000,
       signal: opts.signal,
     })
     const buf = Buffer.from(await res.arrayBuffer())
@@ -823,12 +870,17 @@ export class Sandbox {
     this.diskMiB = record.disk_mib ?? 0
   }
 
-  /** Execute a command and return the result. */
-  async exec(command: string, timeoutSec = 30, opts: RequestOptions = {}): Promise<ExecResult> {
+  /** Execute a command and return the result. Default timeout: 600s (10 min). */
+  async exec(command: string, timeoutSec = 600, opts: RequestOptions = {}): Promise<ExecResult> {
+    // The server runs the command for up to `timeoutSec`; the client transport
+    // must therefore wait at least that long (plus network/overhead margin),
+    // otherwise a long exec is aborted client-side with 'h3 request timeout'
+    // regardless of the caller's timeout. Callers may override via opts.timeoutMs.
+    const timeoutMs = opts.timeoutMs ?? timeoutSec * 1000 + 30_000
     const res = await this.client.json<ExecWire>('POST', `/v1/runs/${this.id}/exec`, {
       command,
       timeout: timeoutSec,
-    }, opts)
+    }, { ...opts, timeoutMs })
     return { exitCode: res.exit_code ?? 1, stdout: res.stdout ?? '', stderr: res.stderr ?? '' }
   }
 

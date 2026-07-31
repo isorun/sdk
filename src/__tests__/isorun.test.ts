@@ -86,12 +86,12 @@ describe('create', () => {
   })
 
   it('uses default image when none specified', async () => {
-    mock.route('POST', '/v1/runs', 200, { id: 'run_def', image: 'node:22-slim', create_ms: 5 })
+    mock.route('POST', '/v1/runs', 200, { id: 'run_def', image: 'node:22', create_ms: 5 })
     await client.create()
 
     const body = JSON.parse(mock.lastRequest().body)
-    expect(body.image).toBe('node:22-slim')
-    expect(body.timeout).toBe(300)
+    expect(body.image).toBe('node:22')
+    expect(body.timeout).toBe(600)
     expect(body).not.toHaveProperty('timeout_sec')
   })
 
@@ -256,7 +256,7 @@ describe('Sandbox.exec', () => {
     const req = mock.requests.find(r => r.url === '/v1/runs/run_e/exec')!
     const body = JSON.parse(req.body)
     expect(body.command).toBe('echo hello')
-    expect(body.timeout).toBe(30)
+    expect(body.timeout).toBe(600)
   })
 
   it('respects custom timeout', async () => {
@@ -571,5 +571,68 @@ describe('Sandbox.auditLog', () => {
     expect(entries[1].timestamp).toBe('2026-05-27T00:00:01Z')
     expect(entries[1].sandboxId).toBe('run_a')
     expect(entries[1].data).toEqual({ cmd: 'node -v' })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Transport fallback safety
+//
+// A lost connection reports "no response received", which is not the same as
+// "the server did not act on it". Falling back and re-sending a POST there can
+// run the request a second time.
+// ---------------------------------------------------------------------------
+
+describe('transport fallback does not duplicate non-idempotent requests', () => {
+  // A client whose native transport always fails with "no response", reporting
+  // whether the request had already gone out on the wire.
+  function clientWithLostH3(sent: boolean): Isorun {
+    const c = new Isorun({ apiKey: 'test_key', apiUrl: `http://127.0.0.1:${port}` })
+    const priv = c as unknown as Record<string, unknown>
+    priv.h3Enabled = true
+    priv.h3Broken = false
+    priv.h3WarmKicked = true // don't open a real pool
+    priv.h3Request = async () => {
+      const err = new Error('h3 transport: stream error') as Error & Record<string, unknown>
+      err.h3transport = true
+      err.h3sent = sent
+      throw err
+    }
+    return c
+  }
+
+  it('throws instead of re-sending a POST that was already on the wire', async () => {
+    mock.route('POST', '/v1/runs', 200, { id: 'run_dup', status: 'running' })
+    const c = clientWithLostH3(true)
+    try {
+      await expect(c.create({ image: 'node:22' })).rejects.toThrow(/not retrying a non-idempotent request/)
+      // The fallback must not have re-issued the create.
+      expect(mock.requests).toHaveLength(0)
+    } finally {
+      c.close()
+    }
+  })
+
+  it('still falls back for a POST that never left the client', async () => {
+    mock.route('POST', '/v1/runs', 200, { id: 'run_ok', status: 'running' })
+    const c = clientWithLostH3(false)
+    try {
+      const sb = await c.create({ image: 'node:22' })
+      expect(sb.id).toBe('run_ok')
+      expect(mock.requests).toHaveLength(1)
+    } finally {
+      c.close()
+    }
+  })
+
+  it('still falls back for an idempotent method even once sent', async () => {
+    mock.route('GET', '/v1/runs', 200, { runs: [{ id: 'run_1', image: 'alpine' }] })
+    const c = clientWithLostH3(true)
+    try {
+      const sandboxes = await c.list()
+      expect(sandboxes).toHaveLength(1)
+      expect(mock.requests).toHaveLength(1)
+    } finally {
+      c.close()
+    }
   })
 })
