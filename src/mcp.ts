@@ -45,7 +45,7 @@ export async function buildServer(options: McpServerOptions = {}): Promise<McpSe
     {
       description: 'Boot a fresh VM sandbox and return its ID.',
       inputSchema: {
-        image: z.string().optional().describe('OCI image. Default: node:22-slim.'),
+        image: z.string().optional().describe('OCI image. Default: node:22.'),
         vcpus: z.number().int().optional(),
         memMiB: z.number().int().optional(),
         diskMiB: z.number().int().optional(),
