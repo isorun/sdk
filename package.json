@@ -90,14 +90,14 @@
     }
   },
   "dependencies": {
-    "undici": "8.3.0"
+    "undici": "8.5.0"
   },
   "optionalDependencies": {
-    "@isorun/http-transport-linux-x64-gnu": "^0.8.8",
+    "@isorun/http-transport-darwin-arm64": "^0.8.8",
     "@isorun/http-transport-linux-arm64-gnu": "^0.8.8",
-    "@isorun/http-transport-linux-x64-musl": "^0.8.8",
     "@isorun/http-transport-linux-arm64-musl": "^0.8.8",
-    "@isorun/http-transport-darwin-arm64": "^0.8.8"
+    "@isorun/http-transport-linux-x64-gnu": "^0.8.8",
+    "@isorun/http-transport-linux-x64-musl": "^0.8.8"
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.98.0",
