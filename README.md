@@ -24,7 +24,7 @@ import { Isorun } from 'isorun'
 
 const isorun = new Isorun() // reads ISORUN_API_KEY from env
 
-const sandbox = await isorun.create({ image: 'node:22-slim' })
+const sandbox = await isorun.create({ image: 'node:22' })
 
 const { stdout } = await sandbox.exec('node -v')
 console.log(stdout) // v22.x.x
@@ -39,7 +39,7 @@ Get an API key at [app.isorun.ai](https://app.isorun.ai).
 ### Run untrusted code
 
 ```ts
-const sandbox = await isorun.create({ image: 'python:3.12-slim' })
+const sandbox = await isorun.create({ image: 'python:3.12' })
 try {
   await sandbox.writeFile('/tmp/code.py', sourceFromLLM)
   const { stdout } = await sandbox.exec('python /tmp/code.py', 30)
@@ -52,7 +52,7 @@ try {
 ### Fork a running sandbox
 
 ```ts
-const parent = await isorun.create({ image: 'node:22-slim' })
+const parent = await isorun.create({ image: 'node:22' })
 await parent.writeFile('/app/worker.js', workerCode)
 
 const workers = await parent.fork(10) // 10 independent clones
@@ -64,7 +64,7 @@ const results = await Promise.all(
 ### Snapshot and restore
 
 ```ts
-const base = await isorun.create({ image: 'python:3.12-slim' })
+const base = await isorun.create({ image: 'python:3.12' })
 await base.exec('pip install pandas numpy')
 const { id } = await base.snapshot()
 await base.destroy()
@@ -198,7 +198,7 @@ All methods are fully typed; see the bundled `.d.ts` or [docs.isorun.ai](https:/
 
 | Field            | Type                                   | Default        | Notes                                  |
 | ---------------- | -------------------------------------- | -------------- | -------------------------------------- |
-| `image`          | `string`                               | `node:22-slim` | Container image.                       |
+| `image`          | `string`                               | `node:22` | Container image.                       |
 | `vcpus`          | `number`                               | `1`            | Virtual CPUs.                          |
 | `memMiB`         | `number`                               | `1024`         | Memory in MiB.                         |
 | `diskMiB`        | `number`                               | `4096`         | Scratch disk; wiped on destroy.        |
