@@ -90,7 +90,7 @@
     }
   },
   "dependencies": {
-    "undici": "8.5.0"
+    "undici": "8.9.0"
   },
   "optionalDependencies": {
     "@isorun/http-transport-darwin-arm64": "^0.8.8",
