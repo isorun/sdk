@@ -95,6 +95,41 @@ interface H3Conn {
   client: any
   waiters: Map<number, H3Pending>
   dead: boolean
+  keepalive: ReturnType<typeof setInterval> | null
+}
+
+interface H3Pool {
+  sessions: (H3Conn | null)[]
+  connecting: (Promise<H3Conn> | null)[]
+  pending: Set<any>
+  ips: string[] | null
+  ipsPromise: Promise<string[]> | null
+  rr: number
+  refs: number
+}
+const h3Pools = new Map<string, H3Pool>()
+const h3PoolKey = (host: string, apiKey: string): string => `${host}|${apiKey}`
+function acquireH3Pool(host: string, apiKey: string): H3Pool {
+  const key = h3PoolKey(host, apiKey)
+  let p = h3Pools.get(key)
+  if (!p) {
+    p = { sessions: [], connecting: [], pending: new Set(), ips: null, ipsPromise: null, rr: 0, refs: 0 }
+    h3Pools.set(key, p)
+  }
+  p.refs++
+  return p
+}
+function releaseH3Pool(host: string, apiKey: string): void {
+  const key = h3PoolKey(host, apiKey)
+  const p = h3Pools.get(key)
+  if (!p || --p.refs > 0) return
+  for (const c of p.pending) { try { c.shutdown?.() } catch { /* ignore */ } }
+  p.pending.clear()
+  for (const conn of p.sessions) {
+    if (conn?.keepalive) { clearInterval(conn.keepalive); conn.keepalive = null }
+    try { conn?.client?.shutdown?.() } catch { /* ignore */ }
+  }
+  h3Pools.delete(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -377,12 +412,7 @@ export class Isorun {
   private readonly h3Enabled: boolean
   private readonly h3host: string
   private readonly h3conns: number
-  private h3Sessions: any[] = []
-  private h3Connecting: (Promise<any> | null)[] = []
-  // Sessions still connecting; close() must be able to destroy these so a
-  // pending connection doesn't keep the process alive.
-  private h3Pending = new Set<any>()
-  private h3rr = 0
+  private readonly h3pool: H3Pool
   // The native transport's callback is unref'd, so we hold the event loop open
   // with a ref-counted timer while work is in flight, and release it when idle.
   private loopHolders = 0
@@ -397,12 +427,10 @@ export class Isorun {
     }
   }
   private h3WarmKicked = false
-  // Resolved server IP, cached. connect() takes a literal IP:port (no DNS); the
-  // hostname is still used for SNI/cert verification.
-  private h3ip: string | null = null
   // Tripped on a connect-level failure of the native transport. Once set,
   // requests go straight to HTTP/2 for the rest of this client's life.
   private h3Broken = false
+  private closed = false
 
   constructor(options: IsorunOptions = {}) {
     this.apiKey = options.apiKey ?? process.env.ISORUN_API_KEY ?? ''
@@ -441,34 +469,38 @@ export class Isorun {
     this.h3Enabled = !!loadBinding()
     // Native transport connection pool size.
     this.h3conns = 4
+    this.h3pool = acquireH3Pool(this.h3host, this.apiKey)
     // The pool opens lazily on the first request; call `connect()` to pre-warm.
   }
 
   /** Close pooled connections so the process can exit cleanly. */
   close(): void {
+    if (this.closed) return
+    this.closed = true
     void this.dispatcher.close()
-    // Shut down both pending and live connections so the process can exit.
-    for (const c of this.h3Pending) { try { c.shutdown?.() } catch { /* ignore */ } }
-    this.h3Pending.clear()
-    for (const conn of this.h3Sessions) {
-      try { conn?.client?.shutdown?.() } catch { /* ignore */ }
-    }
-    this.h3Sessions = []
-    this.h3Connecting = []
+    releaseH3Pool(this.h3host, this.apiKey)
   }
 
-  /** Resolve the runner host to an IPv4 literal (cached); the binding's
-   *  connect() needs an IP, not a hostname. */
-  private async resolveHost(): Promise<string> {
-    if (this.h3ip) return this.h3ip
-    const { lookup } = await import('node:dns/promises')
-    this.h3ip = (await lookup(this.h3host, { family: 4 })).address
-    return this.h3ip
+  /** Resolve the host's IPv4 records; the binding's connect() needs an IP. */
+  private resolveHosts(): Promise<string[]> {
+    if (this.h3pool.ips) return Promise.resolve(this.h3pool.ips)
+    if (this.h3pool.ipsPromise) return this.h3pool.ipsPromise
+    this.h3pool.ipsPromise = (async () => {
+      const { lookup } = await import('node:dns/promises')
+      const recs = await lookup(this.h3host, { family: 4, all: true })
+      const ips = recs.map((r) => r.address)
+      this.h3pool.ips = ips.length ? ips : [this.h3host]
+      return this.h3pool.ips
+    })().catch((e) => {
+      this.h3pool.ipsPromise = null
+      throw e
+    })
+    return this.h3pool.ipsPromise
   }
 
   /** Open a pooled session lazily; requests round-robin across the pool. */
   private getH3Session(): Promise<any> {
-    return this.connectIdx((this.h3rr++) % this.h3conns)
+    return this.connectIdx((this.h3pool.rr++) % this.h3conns)
   }
 
   /**
@@ -492,25 +524,27 @@ export class Isorun {
 
   /** Open (or reuse) the pooled connection at a specific index. */
   private connectIdx(idx: number): Promise<H3Conn> {
-    const existing = this.h3Sessions[idx]
+    const existing = this.h3pool.sessions[idx]
     if (existing && !existing.dead) return Promise.resolve(existing)
-    if (this.h3Connecting[idx]) return this.h3Connecting[idx]!
+    if (this.h3pool.connecting[idx]) return this.h3pool.connecting[idx]!
     const binding = loadBinding()
     if (!binding) return Promise.reject(new Error('h3 binding unavailable'))
     // Per-stream flow-control window, sized to the SDK's small (~KB) payloads.
     const streamWin = 65536
     const initialMaxData = Math.max(streamWin * 64, 4 * 1024 * 1024)
-    this.h3Connecting[idx] = (async (): Promise<H3Conn> => {
-      const ip = await this.resolveHost()
+    this.h3pool.connecting[idx] = (async (): Promise<H3Conn> => {
+      const ips = await this.resolveHosts()
+      const ip = ips[idx % ips.length]
       return await new Promise<H3Conn>((resolve, reject) => {
         const waiters = new Map<number, H3Pending>()
-        const conn: H3Conn = { client: null, waiters, dead: false }
+        const conn: H3Conn = { client: null, waiters, dead: false, keepalive: null }
         let onConnect: (() => void) | null = null
         // Terminal connection failure: reject every in-flight waiter as a
         // (fallback-eligible) transport error and retire this pool slot.
         const failAll = () => {
           conn.dead = true
-          if (this.h3Sessions[idx] === conn) this.h3Sessions[idx] = null
+          if (conn.keepalive) { clearInterval(conn.keepalive); conn.keepalive = null }
+          if (this.h3pool.sessions[idx] === conn) this.h3pool.sessions[idx] = null
           for (const [sid, p] of waiters) { waiters.delete(sid); p.failTransport() }
         }
         const client = new binding.NativeWorkerClient(
@@ -553,10 +587,10 @@ export class Isorun {
           },
         )
         conn.client = client
-        this.h3Pending.add(client)
+        this.h3pool.pending.add(client)
         const timer = setTimeout(() => {
-          this.h3Pending.delete(client)
-          this.h3Connecting[idx] = null
+          this.h3pool.pending.delete(client)
+          this.h3pool.connecting[idx] = null
           try { client.shutdown() } catch { /* ignore */ }
           reject(new Error('h3 connect timeout'))
         }, 10_000)
@@ -564,22 +598,26 @@ export class Isorun {
         timer.unref?.()
         onConnect = () => {
           clearTimeout(timer)
-          this.h3Pending.delete(client)
-          this.h3Sessions[idx] = conn
-          this.h3Connecting[idx] = null
+          this.h3pool.pending.delete(client)
+          this.h3pool.sessions[idx] = conn
+          this.h3pool.connecting[idx] = null
+          conn.keepalive = setInterval(() => {
+            if (conn.waiters.size > 0) { try { client.ping() } catch { /* gone; failTransport handles it */ } }
+          }, H3_PING_INTERVAL_MS)
+          conn.keepalive.unref?.()
           resolve(conn)
         }
         try {
           client.connect(`${ip}:443`, this.h3host)
         } catch (e) {
           clearTimeout(timer)
-          this.h3Pending.delete(client)
-          this.h3Connecting[idx] = null
+          this.h3pool.pending.delete(client)
+          this.h3pool.connecting[idx] = null
           reject(e)
         }
       })
     })()
-    return this.h3Connecting[idx]!
+    return this.h3pool.connecting[idx]!
   }
 
   // Send a request over the native transport. A non-2xx throws an IsorunError;
@@ -596,16 +634,9 @@ export class Isorun {
       let settled = false
       let sid = -1
       let timer: ReturnType<typeof setTimeout>
-      // Keep the connection alive while the server is still working. unref'd so
-      // it can never hold the process open on its own.
-      const keepalive = setInterval(() => {
-        try { conn.client?.ping() } catch { /* session already gone; failTransport handles it */ }
-      }, H3_PING_INTERVAL_MS)
-      keepalive.unref?.()
       const onAbort = () => bad(opts.signal?.reason ?? new Error('aborted'))
       const cleanup = () => {
         clearTimeout(timer)
-        clearInterval(keepalive)
         opts.signal?.removeEventListener('abort', onAbort)
         if (sid >= 0) conn.waiters.delete(sid)
       }
